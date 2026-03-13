@@ -1,0 +1,43 @@
+services:
+  speaches-original:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    container_name: speaches-original
+    ports:
+      - "8102:8000"
+    volumes:
+      - ${MODEL_CACHE_DIR:-~/models/audio/huggingface/hub}:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      - WHISPER__COMPUTE_TYPE=float16
+      - WHISPER__INFERENCE_DEVICE=cuda
+      - STT_MODEL_TTL=-1
+      - VAD_MODEL_TTL=-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  speaches-custom:
+    image: speaches-custom:1.0.0
+    container_name: speaches-custom
+    ports:
+      - "8103:8000"
+    volumes:
+      - ${MODEL_CACHE_DIR:-~/models/audio/huggingface/hub}:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      - WHISPER__BATCH_SIZE=64
+      - WHISPER__COMPUTE_TYPE=float16
+      - WHISPER__INFERENCE_DEVICE=cuda
+      - WHISPER__DEVICE_INDEX=0
+      - WHISPER__NUM_WORKERS=1
+      - STT_MODEL_TTL=-1
+      - VAD_MODEL_TTL=-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]

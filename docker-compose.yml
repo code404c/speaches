@@ -1,0 +1,18 @@
+services:
+  speaches:
+    image: speaches-custom:1.0.0
+    container_name: speaches
+    restart: unless-stopped
+    ports:
+      - "8102:8000"
+    volumes:
+      - ${MODEL_CACHE_DIR:-~/models/audio/huggingface/hub}:/home/ubuntu/.cache/huggingface/hub
+    env_file:
+      - .env
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
