@@ -48,6 +48,7 @@ TASK_NAME_TAG = "automatic-speech-recognition"
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
 
+# Hugging Face 模型过滤器，专门查找基于 CTranslate2 的 ASR 模型
 hf_model_filter = HfModelFilter(
     library_name=LIBRARY_NAME,
     task=TASK_NAME_TAG,
@@ -55,6 +56,7 @@ hf_model_filter = HfModelFilter(
 
 
 class WhisperModelFiles(BaseModel):
+    """Whisper 模型所需的文件路径定义。"""
     model: Path
     config: Path
     tokenizer: Path
@@ -62,7 +64,9 @@ class WhisperModelFiles(BaseModel):
 
 
 class WhisperModelRegistry(ModelRegistry[Model, WhisperModelFiles]):
+    """Whisper 模型注册表，处理远程下载和本地缓存管理。"""
     def list_remote_models(self) -> Generator[Model]:
+        """列出 Hugging Face 上符合条件的远程模型。"""
         models = huggingface_hub.list_models(**self.hf_model_filter.list_model_kwargs(), cardData=True)
         for model in models:
             assert model.created_at is not None and model.card_data is not None, model
@@ -75,6 +79,7 @@ class WhisperModelRegistry(ModelRegistry[Model, WhisperModelFiles]):
             )
 
     def list_local_models(self) -> Generator[Model]:
+        """列出本地缓存中符合条件的模型。"""
         cached_model_repos_info = get_cached_model_repos_info()
         for cached_repo_info in cached_model_repos_info:
             model_card_data = get_model_card_data_from_cached_repo_info(cached_repo_info)
@@ -90,13 +95,14 @@ class WhisperModelRegistry(ModelRegistry[Model, WhisperModelFiles]):
                 )
 
     def get_model_files(self, model_id: str) -> WhisperModelFiles:
+        """获取本地模型文件的完整路径。"""
         model_files = list(list_model_files(model_id))
 
-        # the necessary files are specified in `faster_whisper.transcribe`
+        # 确保包含 faster_whisper 所需的核心文件
         model_file_path = next(file_path for file_path in model_files if file_path.name == "model.bin")
         config_file_path = next(
             file_path for file_path in model_files if file_path.name == "config.json"
-        )  # NOTE: I don't think this file is used
+        )
         tokenizer_file_path = next(file_path for file_path in model_files if file_path.name == "tokenizer.json")
         preprocessor_config_file_path = next(
             file_path for file_path in model_files if file_path.name == "preprocessor_config.json"
@@ -109,7 +115,7 @@ class WhisperModelRegistry(ModelRegistry[Model, WhisperModelFiles]):
         )
 
     def download_model_files(self, model_id: str) -> None:
-        # Taken from faster_whisper/utils.py
+        """从 Hugging Face 下载指定的 Whisper 模型文件。"""
         allow_patterns = [
             "config.json",
             "preprocessor_config.json",
@@ -126,11 +132,13 @@ whisper_model_registry = WhisperModelRegistry(hf_model_filter=hf_model_filter)
 
 
 class WhisperModelManager(BaseModelManager[WhisperModel]):
+    """Whisper 模型管理器，实现具体的加载和请求处理逻辑。"""
     def __init__(self, ttl: int, whisper_config: WhisperConfig) -> None:
         super().__init__(ttl)
         self.whisper_config = whisper_config
 
     def _load_fn(self, model_id: str) -> WhisperModel:
+        """加载 WhisperModel 实例。"""
         return WhisperModel(
             model_id,
             device=self.whisper_config.inference_device,
@@ -146,14 +154,16 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
         request: TranscriptionRequest,
         **_kwargs,
     ) -> NonStreamingTranscriptionResponse:
+        """处理非流式转录请求。使用 BatchedInferencePipeline 提高效率。"""
         if request.response_format == "diarized_json":
             raise NotImplementedError(
-                f"'{request.response_format}' response format is not supported for '{request.model}' model."
+                f"'{request.response_format}' 响应格式暂不支持 '{request.model}' 模型。"
             )
         timelog_start = time.perf_counter()
         with self.load_model(request.model) as whisper:
             whisper_model = BatchedInferencePipeline(model=whisper)
 
+            # 根据 VAD 结果合并语音段，生成 clip_timestamps 以减少非语音部分的干扰
             clip_timestamps = merge_segments(
                 request.speech_segments,
                 request.vad_options,
@@ -174,13 +184,14 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
 
             segments = list(segments)
 
+            # 转换为指定的响应格式
             res = segments_to_transcription_response(
                 segments,
                 transcription_info,
                 response_format=request.response_format,
             )
             logger.info(
-                f"Transcribed {request.audio.duration} seconds of audio in {time.perf_counter() - timelog_start} seconds"
+                f"在 {time.perf_counter() - timelog_start:.2f} 秒内转录了 {request.audio.duration:.2f} 秒的音频"
             )
             return res
 
@@ -190,6 +201,7 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
         request: TranscriptionRequest,
         **_kwargs,
     ) -> Generator[StreamingTranscriptionEvent]:
+        """处理流式转录请求，逐段返回结果。"""
         timelog_start = time.perf_counter()
         with self.load_model(request.model) as whisper:
             whisper_model = BatchedInferencePipeline(model=whisper)
@@ -213,20 +225,23 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
             )
 
             for segment in segments:
+                # 返回转录增量
                 yield openai.types.audio.TranscriptionTextDeltaEvent(
                     type="transcript.text.delta", delta=segment.text, logprobs=None
                 )
 
+            # 返回转录完成事件
             yield openai.types.audio.TranscriptionTextDoneEvent(
                 type="transcript.text.done", text="".join(segment.text for segment in segments), logprobs=None
             )
         logger.info(
-            f"Transcribed {request.audio.duration} seconds of audio in {time.perf_counter() - timelog_start} seconds"
+            f"在 {time.perf_counter() - timelog_start:.2f} 秒内通过流式完成转录"
         )
 
     def handle_transcription_request(
         self, request: TranscriptionRequest, **kwargs
     ) -> NonStreamingTranscriptionResponse | Generator[StreamingTranscriptionEvent]:
+        """根据请求参数选择流式或非流式处理方式。"""
         if request.stream:
             return self.handle_streaming_transcription_request(request, **kwargs)
         else:
@@ -238,9 +253,10 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
         request: TranslationRequest,
         **_kwargs,
     ) -> TranslationResponse:
+        """处理音频翻译请求（翻译为英文）。"""
         if request.response_format == "diarized_json":
             raise NotImplementedError(
-                f"'{request.response_format}' response format is not supported for '{request.model}' model."
+                f"'{request.response_format}' 响应格式暂不支持 '{request.model}' 模型。"
             )
         with self.load_model(request.model) as whisper:
             whisper_model = BatchedInferencePipeline(model=whisper)
@@ -263,6 +279,7 @@ class WhisperModelManager(BaseModelManager[WhisperModel]):
 
 
 def segments_to_text(segments: Iterable[faster_whisper.transcribe.Segment]) -> str:
+    """提取所有段落的文本并合并。"""
     return "".join(segment.text for segment in segments).strip()
 
 
@@ -271,6 +288,7 @@ def segments_to_transcription_response(
     transcription_info: faster_whisper.transcribe.TranscriptionInfo,
     response_format: ResponseFormat,
 ) -> NonStreamingTranscriptionResponse:
+    """将推理段落列表转换为符合 API 要求的响应格式。"""
     match response_format:
         case "text":
             return segments_to_text(segments), "text/plain"
@@ -292,7 +310,7 @@ def segments_to_transcription_response(
                         end=segment.end,
                         text=segment.text,
                         tokens=segment.tokens,
-                        temperature=segment.temperature or 0,  # FIX: hardcoded
+                        temperature=segment.temperature or 0,
                         avg_logprob=segment.avg_logprob,
                         compression_ratio=segment.compression_ratio,
                         no_speech_prob=segment.no_speech_prob,
@@ -328,6 +346,7 @@ def segments_to_translation_response(
     transcription_info: faster_whisper.transcribe.TranscriptionInfo,
     response_format: ResponseFormat,
 ) -> TranslationResponse:
+    """将推理段落列表转换为翻译响应格式。"""
     match response_format:
         case "text":
             return segments_to_text(segments), "text/plain"
@@ -349,7 +368,7 @@ def segments_to_translation_response(
                         end=segment.end,
                         text=segment.text,
                         tokens=segment.tokens,
-                        temperature=segment.temperature or 0,  # FIX: hardcoded
+                        temperature=segment.temperature or 0,
                         avg_logprob=segment.avg_logprob,
                         compression_ratio=segment.compression_ratio,
                         no_speech_prob=segment.no_speech_prob,

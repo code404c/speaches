@@ -36,23 +36,29 @@ from speaches.text_utils import format_as_sse
 
 logger = logging.getLogger(__name__)
 
+# 定义 STT 路由，标签为自动语音识别 (ASR)
 router = APIRouter(tags=["automatic-speech-recognition"])
 
+# 支持的响应格式类型
 type ResponseFormat = Literal["text", "json", "verbose_json", "srt", "vtt"]
 RESPONSE_FORMATS = ("text", "json", "verbose_json", "srt", "vtt")
 
+# 默认响应格式为 json，符合 OpenAI API 规范
 # https://platform.openai.com/docs/api-reference/audio/createTranscription#audio-createtranscription-response_format
 DEFAULT_RESPONSE_FORMAT: ResponseFormat = "json"
 
-# NOTE: copied from `faster_whisper.transcribe`
+# 默认的 VAD (语音活动检测) 选项，参考 faster_whisper
 DEFAULT_VAD_OPTIONS = VadOptions(min_silence_duration_ms=160, max_speech_duration_s=30)
 
 
 def translation_response_to_http_response(res: TranslationResponse) -> Response:  # noqa: RET503
+    """将翻译响应转换为 HTTP 响应对象。"""
     if isinstance(res, tuple):
+        # 处理原始文本响应（如 SRT/VTT）
         text, media_type = res
         return Response(content=text, media_type=media_type)
     elif isinstance(res, (openai.types.audio.Translation, openai.types.audio.TranslationVerbose)):
+        # 处理 JSON 响应
         return Response(content=res.model_dump_json(), media_type="application/json")
 
 
@@ -68,12 +74,16 @@ def translate_file(
     response_format: Annotated[ResponseFormat, Form()] = DEFAULT_RESPONSE_FORMAT,
     temperature: Annotated[float, Form()] = 0.0,
 ) -> Response:
+    """音频翻译接口：将语音翻译为英文。"""
     model_card_data = get_model_card_data_or_raise(model)
+    # 查找负责翻译任务的执行器
     executor = find_executor_for_model_or_raise(model, model_card_data, executor_registry.translation)
 
+    # 首先执行 VAD，识别有效语音片段，减少静音引起的幻觉
     vad_request = VadRequest(audio=audio, vad_options=DEFAULT_VAD_OPTIONS)
     speech_segments = executor_registry.vad.model_manager.handle_vad_request(vad_request)
 
+    # 构造翻译请求并调用执行器
     translation_request = TranslationRequest(
         audio=audio,
         model=model,
@@ -87,14 +97,17 @@ def translate_file(
     return translation_response_to_http_response(res)
 
 
-# HACK: Since Form() doesn't support `alias`, we need to use a workaround.
 async def get_timestamp_granularities(request: Request) -> TimestampGranularities:
+    """
+    由于 Form() 不支持带有中括号的别名（如 timestamp_granularities[]），
+    我们需要手动从请求表单中解析此参数。
+    """
     form = await request.form()
     if form.get("timestamp_granularities[]") is None:
         return DEFAULT_TIMESTAMP_GRANULARITIES
     timestamp_granularities = form.getlist("timestamp_granularities[]")
     assert timestamp_granularities in TIMESTAMP_GRANULARITIES_COMBINATIONS, (
-        f"{timestamp_granularities} is not a valid value for `timestamp_granularities[]`."
+        f"{timestamp_granularities} 不是有效的 `timestamp_granularities[]` 值。"
     )
     return timestamp_granularities  # pyright: ignore[reportReturnType]
 
@@ -102,21 +115,22 @@ async def get_timestamp_granularities(request: Request) -> TimestampGranularitie
 def transcription_response_to_http_response(
     res: NonStreamingTranscriptionResponse | Generator[StreamingTranscriptionEvent],
 ) -> Response | StreamingResponse:
-    logger.error(f"Unexpected streaming transcription response type: {type(res)}")
+    """将转录响应转换为 HTTP 响应或流式响应。"""
     if isinstance(res, tuple):
+        # 原始文本响应
         text, media_type = res
         return Response(content=text, media_type=media_type)
     elif isinstance(res, (openai.types.audio.Transcription, openai.types.audio.TranscriptionVerbose)):
+        # 非流式 JSON 响应
         return Response(content=res.model_dump_json(), media_type="application/json")
     else:
+        # 流式响应：使用 SSE (Server-Sent Events) 格式
         return StreamingResponse(
             (format_as_sse(x.model_dump_json()) for x in res),
             media_type="text/event-stream",
         )
 
 
-# https://platform.openai.com/docs/api-reference/audio/createTranscription
-# https://github.com/openai/openai-openapi/blob/master/openapi.yaml#L8915
 @router.post(
     "/v1/audio/transcriptions",
     response_model=str | openai.types.audio.Transcription | openai.types.audio.TranscriptionVerbose,
@@ -132,28 +146,33 @@ def transcribe_file(
     temperature: Annotated[float, Form()] = 0.0,
     timestamp_granularities: Annotated[
         TimestampGranularities,
-        # WARN: `alias` doesn't actually work.
+        # 注意：这里的 alias 实际上在 multipart/form-data 中失效，需手动解析
         Form(alias="timestamp_granularities[]"),
     ] = ["segment"],
     stream: Annotated[bool, Form()] = False,
-    # non standard parameters
+    # 非标准扩展参数
     hotwords: Annotated[str | None, Form()] = None,
     without_timestamps: Annotated[bool, Form()] = True,
 ) -> Response | StreamingResponse:
+    """音频转录接口：将语音转换为文本。"""
+    # 手动解析时间戳颗粒度选项
     timestamp_granularities = asyncio.run(get_timestamp_granularities(request))
     if timestamp_granularities != DEFAULT_TIMESTAMP_GRANULARITIES and response_format != "verbose_json":
         logger.warning(
-            "It only makes sense to provide `timestamp_granularities[]` when `response_format` is set to `verbose_json`. See https://platform.openai.com/docs/api-reference/audio/createTranscription#audio-createtranscription-timestamp_granularities."
+            "仅当 `response_format` 为 `verbose_json` 时，提供 `timestamp_granularities[]` 才有意义。"
         )
 
     transcription_model_card_data = get_model_card_data_or_raise(model)
+    # 查找负责转录任务的执行器
     transcription_executor = find_executor_for_model_or_raise(
         model, transcription_model_card_data, executor_registry.transcription
     )
 
+    # 执行 VAD
     vad_request = VadRequest(audio=audio, vad_options=DEFAULT_VAD_OPTIONS)
     speech_segments = executor_registry.vad.model_manager.handle_vad_request(vad_request)
 
+    # 构造转录请求
     transcription_request = TranscriptionRequest(
         audio=audio,
         model=model,
@@ -168,6 +187,7 @@ def transcribe_file(
         vad_options=DEFAULT_VAD_OPTIONS,
         without_timestamps=without_timestamps,
     )
+    # 调用执行器并返回响应
     res = transcription_executor.model_manager.handle_transcription_request(transcription_request)
     http_res = transcription_response_to_http_response(res)
     return http_res
